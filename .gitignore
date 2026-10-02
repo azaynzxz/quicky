@@ -1,0 +1,20 @@
+# Build and compiler output
+build/
+bin/
+obj/
+*.log
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.suo
+*.user
+
+# IDE and Editor configurations
+.vs/
+.vscode/
+*.sln.docstates
+
+# Temporary files
+*.tmp
+*~
