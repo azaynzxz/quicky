@@ -516,6 +516,8 @@ inline bool CanPasteFromClipboard() {
     if (IsClipboardFormatAvailable(CF_HDROP)) return true;
     UINT cfPng = RegisterClipboardFormatW(L"PNG");
     if (cfPng != 0 && IsClipboardFormatAvailable(cfPng)) return true;
+    UINT cfMimePng = RegisterClipboardFormatW(L"image/png");
+    if (cfMimePng != 0 && IsClipboardFormatAvailable(cfMimePng)) return true;
     if (IsClipboardFormatAvailable(CF_DIB)) return true;
     if (IsClipboardFormatAvailable(CF_DIBV5)) return true;
     if (IsClipboardFormatAvailable(CF_BITMAP)) return true;
@@ -525,13 +527,19 @@ inline bool CanPasteFromClipboard() {
 /**
  * @brief Pastes bitmap or PNG data from clipboard directly into target folder.
  */
-inline bool PasteImageFromClipboard(const std::wstring& destFolder) {
+inline bool PasteImageFromClipboard(const std::wstring& destFolder, std::wstring* pOutSavedPath = nullptr) {
     UINT cfPng = RegisterClipboardFormatW(L"PNG");
-    bool hasPng = (cfPng != 0 && IsClipboardFormatAvailable(cfPng));
+    UINT cfMimePng = RegisterClipboardFormatW(L"image/png");
+    UINT activePng = 0;
+    if (cfPng != 0 && IsClipboardFormatAvailable(cfPng)) activePng = cfPng;
+    else if (cfMimePng != 0 && IsClipboardFormatAvailable(cfMimePng)) activePng = cfMimePng;
+
+    bool hasPng = (activePng != 0);
     bool hasDib = IsClipboardFormatAvailable(CF_DIB) || IsClipboardFormatAvailable(CF_DIBV5);
     bool hasBmp = IsClipboardFormatAvailable(CF_BITMAP);
 
     if (!hasPng && !hasDib && !hasBmp) {
+        LOG_INFO(L"PasteImageFromClipboard: No image format available on clipboard");
         return false;
     }
 
@@ -545,17 +553,21 @@ inline bool PasteImageFromClipboard(const std::wstring& destFolder) {
 
     // 1. Try raw PNG clipboard data first (browsers provide pristine PNG bytes)
     if (hasPng) {
-        HANDLE hData = GetClipboardData(cfPng);
+        HANDLE hData = GetClipboardData(activePng);
         if (hData) {
             void* pData = GlobalLock(hData);
             size_t size = GlobalSize(hData);
-            if (pData && size > 0) {
-                FILE* fp = nullptr;
-                if (_wfopen_s(&fp, filePath.c_str(), L"wb") == 0 && fp) {
-                    fwrite(pData, 1, size, fp);
-                    fclose(fp);
-                    LOG_INFO(L"Pasted PNG from clipboard to: " + filePath);
-                    saved = true;
+            if (pData && size >= 8) {
+                const BYTE* pBytes = static_cast<const BYTE*>(pData);
+                // Verify standard PNG magic signature
+                if (pBytes[0] == 0x89 && pBytes[1] == 0x50 && pBytes[2] == 0x4E && pBytes[3] == 0x47) {
+                    FILE* fp = nullptr;
+                    if (_wfopen_s(&fp, filePath.c_str(), L"wb") == 0 && fp) {
+                        fwrite(pData, 1, size, fp);
+                        fclose(fp);
+                        LOG_INFO(L"Pasted raw PNG from clipboard to: " + filePath);
+                        saved = true;
+                    }
                 }
             }
             GlobalUnlock(hData);
@@ -573,11 +585,13 @@ inline bool PasteImageFromClipboard(const std::wstring& destFolder) {
                     LOG_INFO(L"Pasted bitmap from clipboard as PNG to: " + filePath);
                     saved = true;
                 }
-            } else if (hasDib) {
+            }
+            if (!saved && hasDib) {
                 HANDLE hDib = GetClipboardData(CF_DIB);
                 if (hDib) {
                     BITMAPINFO* pbi = static_cast<BITMAPINFO*>(GlobalLock(hDib));
                     if (pbi) {
+                        HDC hdcScreen = GetDC(NULL);
                         int colors = pbi->bmiHeader.biClrUsed;
                         if (colors == 0 && pbi->bmiHeader.biBitCount <= 8) {
                             colors = 1 << pbi->bmiHeader.biBitCount;
@@ -586,10 +600,16 @@ inline bool PasteImageFromClipboard(const std::wstring& destFolder) {
                         if (pbi->bmiHeader.biCompression == BI_BITFIELDS) {
                             pPixels += 12;
                         }
-                        Gdiplus::Bitmap bmp(pbi, pPixels);
-                        if (bmp.Save(filePath.c_str(), &pngClsid, NULL) == Gdiplus::Ok) {
-                            LOG_INFO(L"Pasted DIB from clipboard as PNG to: " + filePath);
-                            saved = true;
+                        HBITMAP hCreatedBmp = CreateDIBitmap(hdcScreen, &pbi->bmiHeader, CBM_INIT, pPixels, pbi, DIB_RGB_COLORS);
+                        ReleaseDC(NULL, hdcScreen);
+
+                        if (hCreatedBmp) {
+                            Gdiplus::Bitmap bmp(hCreatedBmp, NULL);
+                            if (bmp.Save(filePath.c_str(), &pngClsid, NULL) == Gdiplus::Ok) {
+                                LOG_INFO(L"Pasted DIB converted to PNG to: " + filePath);
+                                saved = true;
+                            }
+                            DeleteObject(hCreatedBmp);
                         }
                         GlobalUnlock(hDib);
                     }
@@ -599,14 +619,19 @@ inline bool PasteImageFromClipboard(const std::wstring& destFolder) {
     }
 
     CloseClipboard();
+
+    if (saved && pOutSavedPath) {
+        *pOutSavedPath = filePath;
+    }
     return saved;
 }
 
 /**
  * @brief Pastes any CF_HDROP files or clipboard images into the target folder.
  */
-inline bool PasteFilesFromClipboard(const std::wstring& destFolder, HWND notifyWnd) {
+inline bool PasteFilesFromClipboard(const std::wstring& destFolder, HWND notifyWnd, std::wstring* pOutPastedPath = nullptr) {
     bool success = false;
+    std::wstring lastPasted;
 
     // 1. Try pasting files (CF_HDROP)
     if (IsClipboardFormatAvailable(CF_HDROP)) {
@@ -628,8 +653,9 @@ inline bool PasteFilesFromClipboard(const std::wstring& destFolder, HWND notifyW
                         try {
                             std::filesystem::copy(src, dest, std::filesystem::copy_options::overwrite_existing | std::filesystem::copy_options::recursive);
                             LOG_INFO(L"Pasted file: " + src.wstring());
+                            lastPasted = dest.wstring();
                             success = true;
-                        } catch (...) {
+                        } catch (const std::exception& ex) {
                             LOG_ERROR(L"Error pasting file: " + src.wstring());
                         }
                     }
@@ -642,7 +668,11 @@ inline bool PasteFilesFromClipboard(const std::wstring& destFolder, HWND notifyW
 
     // 2. If no files were pasted, check for clipboard image
     if (!success) {
-        success = PasteImageFromClipboard(destFolder);
+        success = PasteImageFromClipboard(destFolder, &lastPasted);
+    }
+
+    if (pOutPastedPath && success) {
+        *pOutPastedPath = lastPasted;
     }
 
     if (success && notifyWnd) {

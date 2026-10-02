@@ -102,7 +102,9 @@ private:
                 buffer,
                 sizeof(buffer),
                 FALSE, // Do not watch subtrees, only downloads root
-                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_LAST_WRITE |
+                FILE_NOTIFY_CHANGE_SIZE,
                 &bytesReturned,
                 &overlapped,
                 nullptr

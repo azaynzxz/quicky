@@ -393,6 +393,37 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     MSG msg = {};
     while (GetMessage(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && !g_isEditingLabel) {
+            HWND hFocus = GetFocus();
+            bool isOurWindow = (msg.hwnd == g_hWnd || IsChild(g_hWnd, msg.hwnd) || hFocus == g_hWnd || IsChild(g_hWnd, hFocus));
+            if (isOurWindow) {
+                bool isCtrl = (GetKeyState(VK_CONTROL) < 0);
+                bool isShift = (GetKeyState(VK_SHIFT) < 0);
+
+                if (isCtrl && isShift && (msg.wParam == 'N' || msg.wParam == 'n')) {
+                    CreateNewFolder();
+                    continue;
+                }
+                if (isCtrl && (msg.wParam == 'N' || msg.wParam == 'n')) {
+                    CreateNewFile();
+                    continue;
+                }
+                if (isCtrl && (msg.wParam == 'V' || msg.wParam == 'v')) {
+                    bool inSearchEdit = (msg.hwnd == g_hSearchEdit || hFocus == g_hSearchEdit);
+                    bool hasImageOrFiles = CanPasteFromClipboard();
+
+                    if (!inSearchEdit || hasImageOrFiles) {
+                        PasteFiles();
+                        continue;
+                    }
+                }
+                if (msg.wParam == VK_F5) {
+                    LoadFolderFiles(g_activeFolder);
+                    PopulateFolderTree();
+                    continue;
+                }
+            }
+        }
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
@@ -466,7 +497,21 @@ LRESULT CALLBACK ButtonSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM 
 LRESULT CALLBACK SearchEditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
     switch (uMsg) {
         case WM_KEYDOWN: {
-            if (wParam == VK_ESCAPE) {
+            bool isCtrl = (GetKeyState(VK_CONTROL) < 0);
+            bool isShift = (GetKeyState(VK_SHIFT) < 0);
+
+            if (isCtrl && isShift && (wParam == 'N' || wParam == 'n')) {
+                CreateNewFolder();
+                return 0;
+            } else if (isCtrl && (wParam == 'N' || wParam == 'n')) {
+                CreateNewFile();
+                return 0;
+            } else if (isCtrl && (wParam == 'V' || wParam == 'v')) {
+                if (CanPasteFromClipboard()) {
+                    PasteFiles();
+                    return 0;
+                }
+            } else if (wParam == VK_ESCAPE) {
                 SetWindowTextW(hWnd, L"");
                 SetFocus(g_hListView);
                 return 0;
@@ -570,7 +615,10 @@ LRESULT CALLBACK ListViewSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
         case WM_RELOAD_FILES:
-            LoadFolderFiles(g_activeFolder);
+            if (!g_isEditingLabel) {
+                LoadFolderFiles(g_activeFolder);
+                PopulateFolderTree();
+            }
             return 0;
 
         case WM_INITMENUPOPUP:
@@ -1249,8 +1297,13 @@ void NavigateUp() {
  * @brief Creates a new folder in active directory and begins in-place renaming.
  */
 void CreateNewFolder() {
+    if (!g_searchQuery.empty()) {
+        g_searchQuery.clear();
+        SetWindowTextW(g_hSearchEdit, L"");
+    }
+
     namespace fs = std::filesystem;
-    std::wstring baseName = L"New Folder";
+    std::wstring baseName = L"New folder";
     std::wstring candidate = (fs::path(g_activeFolder) / baseName).wstring();
     int counter = 2;
     while (fs::exists(candidate)) {
@@ -1283,6 +1336,11 @@ void CreateNewFolder() {
  * @brief Creates a new text file in active directory and begins in-place renaming.
  */
 void CreateNewFile() {
+    if (!g_searchQuery.empty()) {
+        g_searchQuery.clear();
+        SetWindowTextW(g_hSearchEdit, L"");
+    }
+
     namespace fs = std::filesystem;
     std::wstring baseName = L"New Text Document";
     std::wstring candidate = (fs::path(g_activeFolder) / (baseName + L".txt")).wstring();
@@ -1378,7 +1436,31 @@ void CopySelectedFiles() {
  * @brief Pastes files from clipboard into the active folder.
  */
 void PasteFiles() {
-    PasteFilesFromClipboard(g_activeFolder, g_hWnd);
+    if (!g_searchQuery.empty()) {
+        g_searchQuery.clear();
+        SetWindowTextW(g_hSearchEdit, L"");
+    }
+
+    std::wstring pastedPath;
+    if (PasteFilesFromClipboard(g_activeFolder, g_hWnd, &pastedPath)) {
+        LOG_INFO(L"PasteFiles succeeded, refreshing folder: " + g_activeFolder);
+        LoadFolderFiles(g_activeFolder);
+        PopulateFolderTree();
+
+        if (!pastedPath.empty()) {
+            for (size_t i = 0; i < g_displayedFiles.size(); ++i) {
+                if (g_displayedFiles[i].fullPath == pastedPath) {
+                    ListView_SetItemState(g_hListView, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+                    ListView_SetItemState(g_hListView, static_cast<int>(i), LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                    ListView_EnsureVisible(g_hListView, static_cast<int>(i), FALSE);
+                    SetFocus(g_hListView);
+                    break;
+                }
+            }
+        }
+    } else {
+        LOG_INFO(L"PasteFiles: No pasteable files or image on clipboard");
+    }
 }
 
 /**
@@ -1966,6 +2048,10 @@ void ShowLegacyContextMenu(const std::vector<std::wstring>& filePaths, POINT pt)
 
     InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
     InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_COPY_FILE, L"Copy\tCtrl+C");
+
+    bool canPaste = CanPasteFromClipboard();
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING | (canPaste ? 0 : MF_GRAYED), IDM_PASTE_FILE, L"Paste\tCtrl+V");
+
     InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_RENAME_FILE, L"Rename\tF2");
     InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_DELETE_FILE, L"Delete\tDel");
     InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
