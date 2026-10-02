@@ -3,13 +3,9 @@ echo Building Quicky Installer...
 
 REM Locate Inno Setup Compiler
 set "ISCC_PATH="
-if exist "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" (
-    set "ISCC_PATH=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
-) else if exist "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" (
-    set "ISCC_PATH=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-) else if exist "C:\Program Files\Inno Setup 6\ISCC.exe" (
-    set "ISCC_PATH=C:\Program Files\Inno Setup 6\ISCC.exe"
-)
+if exist "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" set "ISCC_PATH=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
+if "%ISCC_PATH%"=="" if exist "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" set "ISCC_PATH=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+if "%ISCC_PATH%"=="" if exist "C:\Program Files\Inno Setup 6\ISCC.exe" set "ISCC_PATH=C:\Program Files\Inno Setup 6\ISCC.exe"
 
 if "%ISCC_PATH%"=="" (
     echo Error: Inno Setup 6 compiler (ISCC.exe) not found.

@@ -376,7 +376,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     LoadFolderFiles(g_activeFolder);
     SetViewMode(ViewMode::Medium);
 
-    LOG_INFO(L"Quicky initialization complete. Entering message loop.");
+    // Position window anchored at bottom-right above taskbar and show immediately
+    RECT rcWork = {};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &rcWork, 0);
+    int initW = g_showFolderTree ? EXPANDED_WINDOW_WIDTH : COMPACT_WINDOW_WIDTH;
+    int initH = DEFAULT_WINDOW_HEIGHT;
+    int initX = rcWork.right - initW - 16;
+    int initY = rcWork.bottom - initH - 16;
+    if (initX < rcWork.left) initX = rcWork.left + 10;
+    if (initY < rcWork.top) initY = rcWork.top + 10;
+    SetWindowPos(g_hWnd, HWND_TOPMOST, initX, initY, initW, initH, SWP_SHOWWINDOW);
+    SetForegroundWindow(g_hWnd);
+    SetFocus(g_hSearchEdit);
+
+    LOG_INFO(L"Quicky initialization complete. Main window displayed and topmost. Entering message loop.");
 
     MSG msg = {};
     while (GetMessage(&msg, NULL, 0, 0)) {
@@ -852,7 +865,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     break;
 
                 case IDC_BTN_MINIMIZE:
-                    ShowWindow(hwnd, SW_HIDE);
+                    if (IsWindowVisible(hwnd)) {
+                        ShowWindow(hwnd, SW_HIDE);
+                    } else {
+                        RECT rcWork = {};
+                        SystemParametersInfoW(SPI_GETWORKAREA, 0, &rcWork, 0);
+                        int w = g_showFolderTree ? EXPANDED_WINDOW_WIDTH : COMPACT_WINDOW_WIDTH;
+                        int h = DEFAULT_WINDOW_HEIGHT;
+                        int x = rcWork.right - w - 16;
+                        int y = rcWork.bottom - h - 16;
+                        SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
+                        SetForegroundWindow(hwnd);
+                    }
                     break;
 
                 case IDM_OPEN_FILE: {
@@ -986,9 +1010,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             break;
         }
 
+        case WM_WINDOWPOSCHANGING: {
+            WINDOWPOS* pwp = reinterpret_cast<WINDOWPOS*>(lParam);
+            if (pwp && !(pwp->flags & SWP_NOZORDER)) {
+                pwp->hwndInsertAfter = HWND_TOPMOST;
+            }
+            break;
+        }
+
         case WM_ACTIVATE:
             // Quicky stays always on top and visible until manually minimized
             // by the user via the toolbar button or system tray.
+            if (LOWORD(wParam) != WA_INACTIVE) {
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
             return 0;
 
         case WM_TRAYICON: {
@@ -1368,7 +1403,7 @@ void ToggleFolderTree() {
         newLeft = rcWork.left + 10;
     }
 
-    SetWindowPos(g_hWnd, NULL, newLeft, newTop, newW, h, SWP_NOZORDER);
+    SetWindowPos(g_hWnd, HWND_TOPMOST, newLeft, newTop, newW, h, 0);
 
     UpdateListViewLayout();
     InvalidateRect(g_hBtnToggleTree, NULL, TRUE);
@@ -2174,17 +2209,21 @@ void ShowListViewContextMenu(POINT pt) {
 void ShowTrayContextMenu(POINT pt) {
     HMENU hMenu = CreatePopupMenu();
 
+    bool isVisible = IsWindowVisible(g_hWnd);
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDC_BTN_MINIMIZE, isVisible ? L"Hide Quicky" : L"Show Quicky");
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+
     HMENU hViewSub = CreatePopupMenu();
     InsertMenuW(hViewSub, 0, MF_BYPOSITION | MF_STRING | (g_viewMode == ViewMode::Small ? MF_CHECKED : 0), IDM_VIEW_SMALL, L"Small (List)");
     InsertMenuW(hViewSub, 1, MF_BYPOSITION | MF_STRING | (g_viewMode == ViewMode::Medium ? MF_CHECKED : 0), IDM_VIEW_MEDIUM, L"Medium (2-Column Grid)");
     InsertMenuW(hViewSub, 2, MF_BYPOSITION | MF_STRING | (g_viewMode == ViewMode::Big ? MF_CHECKED : 0), IDM_VIEW_BIG, L"Big (Large Thumbnails)");
-    InsertMenuW(hMenu, 0, MF_BYPOSITION | MF_POPUP, (UINT_PTR)hViewSub, L"View Mode");
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_POPUP, (UINT_PTR)hViewSub, L"View Mode");
 
-    InsertMenuW(hMenu, 1, MF_BYPOSITION | MF_STRING, IDM_TOGGLE_TREE, g_showFolderTree ? L"Hide Folder Tree" : L"Show Folder Tree");
-    InsertMenuW(hMenu, 2, MF_BYPOSITION | MF_STRING, IDM_OPEN_FOLDER, L"Open Downloads Folder");
-    InsertMenuW(hMenu, 3, MF_BYPOSITION | MF_STRING, IDM_REFRESH, L"Refresh Downloads");
-    InsertMenuW(hMenu, 4, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
-    InsertMenuW(hMenu, 5, MF_BYPOSITION | MF_STRING, IDM_EXIT, L"Exit Quicky");
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_TOGGLE_TREE, g_showFolderTree ? L"Hide Folder Tree" : L"Show Folder Tree");
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_OPEN_FOLDER, L"Open Downloads Folder");
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_REFRESH, L"Refresh Downloads");
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_EXIT, L"Exit Quicky");
 
     SetForegroundWindow(g_hWnd);
     TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, g_hWnd, NULL);
