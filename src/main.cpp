@@ -6,9 +6,12 @@
 #include <shobjidl.h>
 #include <shlwapi.h>
 #include <string>
+#include <string>
 #include <vector>
 #include <filesystem>
 #include <algorithm>
+#include <gdiplus.h>
+#include <thread>
 
 #include "resource.h"
 #include "Logger.h"
@@ -62,6 +65,8 @@ const UINT IDM_EXIT            = 3010;
 const UINT IDM_VIEW_SMALL      = 3011;
 const UINT IDM_VIEW_MEDIUM     = 3012;
 const UINT IDM_VIEW_BIG        = 3013;
+const UINT IDM_NEW_FOLDER      = 3020;
+const UINT IDM_NEW_FILE        = 3021;
 
 // Global UI Handles
 HWND g_hWnd = NULL;
@@ -98,6 +103,10 @@ HBRUSH g_hHeaderBrush = NULL;
 HBRUSH g_hSearchBgBrush = NULL;
 HPEN g_hBorderPen = NULL;
 
+ULONG_PTR g_gdiplusToken = 0;
+IContextMenu2* g_pContextMenu2 = nullptr;
+IContextMenu3* g_pContextMenu3 = nullptr;
+
 ViewMode g_viewMode = ViewMode::Medium; // Default to 2-column medium tile view
 bool g_showFolderTree = false;
 bool g_isDragging = false;
@@ -107,6 +116,7 @@ struct FileItem {
     std::wstring name;
     std::wstring fullPath;
     std::filesystem::file_time_type lastWriteTime;
+    bool isDirectory = false;
 };
 std::vector<FileItem> g_currentFiles;
 std::vector<FileItem> g_displayedFiles;
@@ -135,7 +145,20 @@ void RenameSelectedFile();
 void DeleteSelectedFile();
 void CopySelectedFiles();
 void PasteFiles();
+void CreateNewFolder();
+void CreateNewFile();
+void NavigateToFolder(const std::wstring& folderPath);
+void NavigateUp();
+struct ArchiverApp;
+bool IsArchiveFile(const std::wstring& filePath, std::wstring* pArchiveStem);
+std::vector<ArchiverApp> DetectInstalledArchivers();
+void ExtractArchiveToSubfolder(const std::wstring& archivePath, HWND notifyWnd);
+void ExtractArchiveHere(const std::wstring& archivePath, HWND notifyWnd);
+void ExtractArchiveWithApp(const ArchiverApp& app, const std::wstring& archivePath, const std::wstring& destDir, HWND notifyWnd);
 void ShowListViewContextMenu(POINT pt);
+void ShowFileContextMenu(HWND hwnd, const std::vector<std::wstring>& filePaths, POINT pt);
+void ShowBackgroundContextMenu(HWND hwnd, POINT pt);
+void ShowLegacyContextMenu(const std::vector<std::wstring>& filePaths, POINT pt);
 void ShowTrayContextMenu(POINT pt);
 void AddButtonTooltip(HWND hBtn, const wchar_t* tipText);
 std::vector<int> GetSelectedListViewIndices();
@@ -173,6 +196,8 @@ std::wstring ToLower(const std::wstring& str) {
  */
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     HRESULT hrOle = OleInitialize(NULL);
+    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+    Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, NULL);
 
     std::wstring logPath = GetExecutableDir() + L"\\quicky.log";
     Logger::init(logPath);
@@ -384,6 +409,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     if (g_hImageListBig) ImageList_Destroy(g_hImageListBig);
     if (g_hTreeImageList) ImageList_Destroy(g_hTreeImageList);
 
+    Gdiplus::GdiplusShutdown(g_gdiplusToken);
     OleUninitialize();
     Logger::shutdown();
     return 0;
@@ -459,7 +485,14 @@ LRESULT CALLBACK ListViewSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
     switch (uMsg) {
         case WM_KEYDOWN: {
             bool isCtrl = (GetKeyState(VK_CONTROL) < 0);
-            if (isCtrl && (wParam == 'F' || wParam == 'f')) {
+            bool isShift = (GetKeyState(VK_SHIFT) < 0);
+            if (isCtrl && isShift && (wParam == 'N' || wParam == 'n')) {
+                CreateNewFolder();
+                return 0;
+            } else if (isCtrl && (wParam == 'N' || wParam == 'n')) {
+                CreateNewFile();
+                return 0;
+            } else if (isCtrl && (wParam == 'F' || wParam == 'f')) {
                 SetFocus(g_hSearchEdit);
                 SendMessageW(g_hSearchEdit, EM_SETSEL, 0, -1);
                 return 0;
@@ -471,6 +504,9 @@ LRESULT CALLBACK ListViewSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
                 return 0;
             } else if (isCtrl && (wParam == 'T' || wParam == 't')) {
                 CycleViewMode();
+                return 0;
+            } else if (wParam == VK_BACK) {
+                NavigateUp();
                 return 0;
             } else if (wParam == VK_F5) {
                 LoadFolderFiles(g_activeFolder);
@@ -524,7 +560,48 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             LoadFolderFiles(g_activeFolder);
             return 0;
 
+        case WM_INITMENUPOPUP:
+            if (g_pContextMenu2) {
+                g_pContextMenu2->HandleMenuMsg(uMsg, wParam, lParam);
+                return 0;
+            }
+            break;
+
+        case WM_MENUCHAR:
+            if (g_pContextMenu3) {
+                LRESULT lRes = 0;
+                if (SUCCEEDED(g_pContextMenu3->HandleMenuMsg2(uMsg, wParam, lParam, &lRes))) {
+                    return lRes;
+                }
+            } else if (g_pContextMenu2) {
+                g_pContextMenu2->HandleMenuMsg(uMsg, wParam, lParam);
+                return 0;
+            }
+            break;
+
+        case WM_MEASUREITEM: {
+            if (wParam == 0 && (g_pContextMenu2 || g_pContextMenu3)) {
+                if (g_pContextMenu3) {
+                    LRESULT lRes = 0;
+                    if (SUCCEEDED(g_pContextMenu3->HandleMenuMsg2(uMsg, wParam, lParam, &lRes))) return TRUE;
+                }
+                if (g_pContextMenu2) {
+                    if (SUCCEEDED(g_pContextMenu2->HandleMenuMsg(uMsg, wParam, lParam))) return TRUE;
+                }
+            }
+            break;
+        }
+
         case WM_DRAWITEM: {
+            if (wParam == 0 && (g_pContextMenu2 || g_pContextMenu3)) {
+                if (g_pContextMenu3) {
+                    LRESULT lRes = 0;
+                    if (SUCCEEDED(g_pContextMenu3->HandleMenuMsg2(uMsg, wParam, lParam, &lRes))) return TRUE;
+                }
+                if (g_pContextMenu2) {
+                    if (SUCCEEDED(g_pContextMenu2->HandleMenuMsg(uMsg, wParam, lParam))) return TRUE;
+                }
+            }
             LPDRAWITEMSTRUCT pdis = reinterpret_cast<LPDRAWITEMSTRUCT>(lParam);
             if (!pdis) break;
 
@@ -800,6 +877,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     DeleteSelectedFile();
                     break;
 
+                case IDM_NEW_FOLDER:
+                    CreateNewFolder();
+                    break;
+
+                case IDM_NEW_FILE:
+                    CreateNewFile();
+                    break;
+
                 case IDM_EXIT:
                     PostQuitMessage(0);
                     break;
@@ -863,8 +948,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
                             if (oldPath != newPath) {
                                 if (MoveFileW(oldPath.c_str(), newPath.c_str())) {
-                                    LOG_INFO(L"Renamed file: " + oldPath + L" -> " + newPath);
+                                    LOG_INFO(L"Renamed item: " + oldPath + L" -> " + newPath);
                                     LoadFolderFiles(g_activeFolder);
+                                    PopulateFolderTree();
                                     return TRUE;
                                 } else {
                                     DWORD err = GetLastError();
@@ -900,34 +986,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             break;
         }
 
-        case WM_ACTIVATE: {
-            static ULONGLONG s_lastDeactivateTick = 0;
-            if (LOWORD(wParam) == WA_INACTIVE) {
-                HWND hNew = reinterpret_cast<HWND>(lParam);
-                if (!g_isDragging && !g_isEditingLabel) {
-                    if (hNew != hwnd && !IsChild(hwnd, hNew)) {
-                        LOG_DEBUG(L"Quicky lost focus to outside window. Auto-hiding.");
-                        s_lastDeactivateTick = GetTickCount64();
-                        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)s_lastDeactivateTick);
-                        ShowWindow(hwnd, SW_HIDE);
-                    }
-                }
-            }
+        case WM_ACTIVATE:
+            // Quicky stays always on top and visible until manually minimized
+            // by the user via the toolbar button or system tray.
             return 0;
-        }
 
         case WM_TRAYICON: {
             if (LOWORD(lParam) == WM_LBUTTONUP) {
-                ULONGLONG lastDeact = (ULONGLONG)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-                ULONGLONG now = GetTickCount64();
-
-                // If window was deactivated in the last 400ms by this click, user intended to toggle close
-                if (now - lastDeact < 400) {
-                    LOG_INFO(L"Tray icon clicked while open. Minimizing popup.");
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                    return 0;
-                }
-
                 if (IsWindowVisible(hwnd)) {
                     LOG_INFO(L"Tray icon clicked while visible. Minimizing popup.");
                     ShowWindow(hwnd, SW_HIDE);
@@ -1106,12 +1171,109 @@ std::vector<int> GetSelectedListViewIndices() {
  */
 void OpenFileAtIndex(int index) {
     if (index >= 0 && index < static_cast<int>(g_displayedFiles.size())) {
-        const std::wstring& path = g_displayedFiles[index].fullPath;
-        LOG_INFO(L"Opening file: " + path);
-        HINSTANCE hInst = ShellExecuteW(NULL, L"open", path.c_str(), NULL, NULL, SW_SHOWNORMAL);
-        if (reinterpret_cast<INT_PTR>(hInst) <= 32) {
-            LOG_ERROR(L"ShellExecuteW failed to open: " + path);
+        const auto& fi = g_displayedFiles[index];
+        if (fi.isDirectory) {
+            NavigateToFolder(fi.fullPath);
+            return;
         }
+        LOG_INFO(L"Opening file: " + fi.fullPath);
+        HINSTANCE hInst = ShellExecuteW(NULL, L"open", fi.fullPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(hInst) <= 32) {
+            LOG_ERROR(L"ShellExecuteW failed to open: " + fi.fullPath);
+        }
+    }
+}
+
+/**
+ * @brief Navigates Quicky into a specified directory.
+ */
+void NavigateToFolder(const std::wstring& folderPath) {
+    if (g_activeFolder == folderPath) return;
+    g_activeFolder = folderPath;
+    LOG_INFO(L"Navigated to: " + g_activeFolder);
+    LoadFolderFiles(g_activeFolder);
+    g_folderWatcher.start(g_activeFolder, g_hWnd);
+    InvalidateRect(g_hWnd, NULL, TRUE);
+}
+
+/**
+ * @brief Navigates up to the parent directory if currently inside a subfolder.
+ */
+void NavigateUp() {
+    namespace fs = std::filesystem;
+    fs::path current(g_activeFolder);
+    if (current != fs::path(g_downloadsPath) && current.has_parent_path()) {
+        fs::path parent = current.parent_path();
+        if (fs::exists(parent)) {
+            NavigateToFolder(parent.wstring());
+        }
+    }
+}
+
+/**
+ * @brief Creates a new folder in active directory and begins in-place renaming.
+ */
+void CreateNewFolder() {
+    namespace fs = std::filesystem;
+    std::wstring baseName = L"New Folder";
+    std::wstring candidate = (fs::path(g_activeFolder) / baseName).wstring();
+    int counter = 2;
+    while (fs::exists(candidate)) {
+        candidate = (fs::path(g_activeFolder) / (baseName + L" (" + std::to_wstring(counter++) + L")")).wstring();
+    }
+
+    try {
+        if (fs::create_directory(candidate)) {
+            LOG_INFO(L"Created new directory: " + candidate);
+            PopulateFolderTree();
+            LoadFolderFiles(g_activeFolder);
+
+            for (size_t i = 0; i < g_displayedFiles.size(); ++i) {
+                if (g_displayedFiles[i].fullPath == candidate) {
+                    ListView_SetItemState(g_hListView, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+                    ListView_SetItemState(g_hListView, static_cast<int>(i), LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                    ListView_EnsureVisible(g_hListView, static_cast<int>(i), FALSE);
+                    SetFocus(g_hListView);
+                    ListView_EditLabel(g_hListView, static_cast<int>(i));
+                    break;
+                }
+            }
+        }
+    } catch (const std::exception& ex) {
+        LOG_ERROR(L"Failed to create new directory: " + candidate);
+    }
+}
+
+/**
+ * @brief Creates a new text file in active directory and begins in-place renaming.
+ */
+void CreateNewFile() {
+    namespace fs = std::filesystem;
+    std::wstring baseName = L"New Text Document";
+    std::wstring candidate = (fs::path(g_activeFolder) / (baseName + L".txt")).wstring();
+    int counter = 2;
+    while (fs::exists(candidate)) {
+        candidate = (fs::path(g_activeFolder) / (baseName + L" (" + std::to_wstring(counter++) + L").txt")).wstring();
+    }
+
+    HANDLE hFile = CreateFileW(candidate.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(hFile);
+        LOG_INFO(L"Created new text file: " + candidate);
+        LoadFolderFiles(g_activeFolder);
+
+        for (size_t i = 0; i < g_displayedFiles.size(); ++i) {
+            if (g_displayedFiles[i].fullPath == candidate) {
+                ListView_SetItemState(g_hListView, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+                ListView_SetItemState(g_hListView, static_cast<int>(i), LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                ListView_EnsureVisible(g_hListView, static_cast<int>(i), FALSE);
+                SetFocus(g_hListView);
+                ListView_EditLabel(g_hListView, static_cast<int>(i));
+                break;
+            }
+        }
+    } else {
+        LOG_ERROR(L"Failed to create new file: " + candidate);
     }
 }
 
@@ -1313,25 +1475,31 @@ void LoadFolderFiles(const std::wstring& folderPath) {
 
     try {
         for (const auto& entry : fs::directory_iterator(folderPath)) {
-            if (entry.is_regular_file()) {
-                FileItem fi;
-                fi.name = entry.path().filename().wstring();
-                fi.fullPath = entry.path().wstring();
-                fi.lastWriteTime = entry.last_write_time();
-                items.push_back(fi);
-            }
+            try {
+                if (entry.is_directory() || entry.is_regular_file()) {
+                    FileItem fi;
+                    fi.name = entry.path().filename().wstring();
+                    fi.fullPath = entry.path().wstring();
+                    fi.lastWriteTime = entry.last_write_time();
+                    fi.isDirectory = entry.is_directory();
+                    items.push_back(fi);
+                }
+            } catch (...) {}
         }
     } catch (const std::exception& ex) {
         LOG_ERROR(L"Directory scan error: " + folderPath);
     }
 
     std::sort(items.begin(), items.end(), [](const FileItem& a, const FileItem& b) {
+        if (a.isDirectory != b.isDirectory) {
+            return a.isDirectory > b.isDirectory;
+        }
         return a.lastWriteTime > b.lastWriteTime;
     });
 
     g_currentFiles = items;
     ApplySearchFilter();
-    LOG_INFO(L"Loaded " + std::to_wstring(g_currentFiles.size()) + L" file(s)");
+    LOG_INFO(L"Loaded " + std::to_wstring(g_currentFiles.size()) + L" item(s)");
 }
 
 /**
@@ -1407,7 +1575,568 @@ void PopulateSubfolders(HTREEITEM hParent, const std::wstring& parentPath) {
 }
 
 /**
- * @brief Displays context menu for ListView control.
+ * @brief Background ZIP archive extraction worker using tar.exe.
+ */
+void ExtractZip(const std::wstring& zipPath, const std::wstring& destDir, HWND notifyWnd) {
+    namespace fs = std::filesystem;
+    try {
+        if (!fs::exists(destDir)) {
+            fs::create_directories(destDir);
+        }
+    } catch (...) {}
+
+    std::thread([zipPath, destDir, notifyWnd]() {
+        STARTUPINFOW si = { sizeof(si) };
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi = {0};
+
+        std::wstring cmd = L"tar.exe -xf \"" + zipPath + L"\" -C \"" + destDir + L"\"";
+        std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+        cmdBuf.push_back(L'\0');
+
+        LOG_INFO(L"Extracting ZIP: " + cmd);
+        if (CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            DWORD exitCode = 0;
+            GetExitCodeProcess(pi.hProcess, &exitCode);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            LOG_INFO(L"ZIP extraction completed with exit code: " + std::to_wstring(exitCode));
+        } else {
+            LOG_ERROR(L"Failed to launch tar.exe for extraction: " + std::to_wstring(GetLastError()));
+        }
+
+        if (notifyWnd) {
+            PostMessageW(notifyWnd, WM_RELOAD_FILES, 0, 0);
+        }
+    }).detach();
+}
+
+/**
+ * @brief Representation of an installed archiving tool on the host system.
+ */
+struct ArchiverApp {
+    std::wstring name;
+    std::wstring guiExe;
+    std::wstring cliExe;
+    enum class AppType {
+        SevenZip,
+        WinRar,
+        Bandizip,
+        PeaZip,
+        WindowsBuiltIn
+    } type;
+};
+
+/**
+ * @brief Checks if a file path is a supported archive and extracts its clean stem name.
+ */
+bool IsArchiveFile(const std::wstring& filePath, std::wstring* pArchiveStem) {
+    namespace fs = std::filesystem;
+    fs::path p(filePath);
+    std::wstring ext = ToLower(p.extension().wstring());
+
+    static const std::vector<std::wstring> s_archiveExts = {
+        L".zip", L".7z", L".rar", L".tar", L".gz", L".bz2", L".xz",
+        L".tgz", L".tbz2", L".txz", L".iso", L".cab", L".wim", L".zst",
+        L".apk", L".jar"
+    };
+
+    for (const auto& aExt : s_archiveExts) {
+        if (ext == aExt) {
+            if (pArchiveStem) {
+                std::wstring stem = p.stem().wstring();
+                std::wstring innerExt = ToLower(fs::path(stem).extension().wstring());
+                if (innerExt == L".tar") {
+                    stem = fs::path(stem).stem().wstring();
+                }
+                *pArchiveStem = stem;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief Scans the Windows system and registry for installed archiving applications.
+ */
+std::vector<ArchiverApp> DetectInstalledArchivers() {
+    std::vector<ArchiverApp> apps;
+    namespace fs = std::filesystem;
+
+    // 1. 7-Zip
+    std::vector<std::wstring> sevenZipDirs = {
+        L"C:\\Program Files\\7-Zip",
+        L"C:\\Program Files (x86)\\7-Zip"
+    };
+    HKEY hKey = NULL;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\7-Zip", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        wchar_t buf[MAX_PATH];
+        DWORD size = sizeof(buf);
+        if (RegQueryValueExW(hKey, L"Path", NULL, NULL, reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
+            sevenZipDirs.push_back(buf);
+        }
+        RegCloseKey(hKey);
+    }
+    for (const auto& dir : sevenZipDirs) {
+        fs::path p7z(dir);
+        fs::path gui = p7z / L"7zG.exe";
+        fs::path cli = p7z / L"7z.exe";
+        if (fs::exists(gui) || fs::exists(cli)) {
+            ArchiverApp app;
+            app.name = L"7-Zip";
+            app.guiExe = fs::exists(gui) ? gui.wstring() : cli.wstring();
+            app.cliExe = fs::exists(cli) ? cli.wstring() : gui.wstring();
+            app.type = ArchiverApp::AppType::SevenZip;
+            apps.push_back(app);
+            break;
+        }
+    }
+
+    // 2. WinRAR
+    std::vector<std::wstring> winRarDirs = {
+        L"C:\\Program Files\\WinRAR",
+        L"C:\\Program Files (x86)\\WinRAR"
+    };
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WinRAR", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        wchar_t buf[MAX_PATH];
+        DWORD size = sizeof(buf);
+        if (RegQueryValueExW(hKey, L"exe64", NULL, NULL, reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
+            winRarDirs.push_back(fs::path(buf).parent_path().wstring());
+        }
+        RegCloseKey(hKey);
+    }
+    for (const auto& dir : winRarDirs) {
+        fs::path pRar = fs::path(dir) / L"WinRAR.exe";
+        if (fs::exists(pRar)) {
+            ArchiverApp app;
+            app.name = L"WinRAR";
+            app.guiExe = pRar.wstring();
+            app.cliExe = pRar.wstring();
+            app.type = ArchiverApp::AppType::WinRar;
+            apps.push_back(app);
+            break;
+        }
+    }
+
+    // 3. Bandizip
+    std::vector<std::wstring> bandiDirs = {
+        L"C:\\Program Files\\Bandizip",
+        L"C:\\Program Files (x86)\\Bandizip"
+    };
+    for (const auto& dir : bandiDirs) {
+        fs::path pBandi = fs::path(dir) / L"Bandizip.exe";
+        if (fs::exists(pBandi)) {
+            ArchiverApp app;
+            app.name = L"Bandizip";
+            app.guiExe = pBandi.wstring();
+            app.cliExe = pBandi.wstring();
+            app.type = ArchiverApp::AppType::Bandizip;
+            apps.push_back(app);
+            break;
+        }
+    }
+
+    // 4. PeaZip
+    std::vector<std::wstring> peaDirs = {
+        L"C:\\Program Files\\PeaZip",
+        L"C:\\Program Files (x86)\\PeaZip"
+    };
+    for (const auto& dir : peaDirs) {
+        fs::path pPea = fs::path(dir) / L"peazip.exe";
+        if (fs::exists(pPea)) {
+            ArchiverApp app;
+            app.name = L"PeaZip";
+            app.guiExe = pPea.wstring();
+            app.cliExe = pPea.wstring();
+            app.type = ArchiverApp::AppType::PeaZip;
+            apps.push_back(app);
+            break;
+        }
+    }
+
+    // 5. Windows Built-in (tar.exe)
+    wchar_t sysDir[MAX_PATH];
+    if (GetSystemDirectoryW(sysDir, MAX_PATH)) {
+        fs::path pTar = fs::path(sysDir) / L"tar.exe";
+        if (fs::exists(pTar)) {
+            ArchiverApp app;
+            app.name = L"Windows Built-in Extractor";
+            app.guiExe = pTar.wstring();
+            app.cliExe = pTar.wstring();
+            app.type = ArchiverApp::AppType::WindowsBuiltIn;
+            apps.push_back(app);
+        }
+    }
+
+    return apps;
+}
+
+/**
+ * @brief Executes archive extraction using a selected archiver application.
+ */
+void ExecuteExtraction(const ArchiverApp& app, const std::wstring& archivePath, const std::wstring& destDir, bool isGui, HWND notifyWnd) {
+    namespace fs = std::filesystem;
+    try {
+        if (!fs::exists(destDir)) {
+            fs::create_directories(destDir);
+        }
+    } catch (...) {}
+
+    std::wstring exe = isGui ? app.guiExe : app.cliExe;
+    std::wstring cmd;
+
+    switch (app.type) {
+        case ArchiverApp::AppType::SevenZip:
+            if (isGui) {
+                cmd = L"\"" + exe + L"\" x \"" + archivePath + L"\" -o\"" + destDir + L"\"";
+            } else {
+                cmd = L"\"" + exe + L"\" x \"" + archivePath + L"\" -o\"" + destDir + L"\" -y";
+            }
+            break;
+
+        case ArchiverApp::AppType::WinRar:
+            if (isGui) {
+                cmd = L"\"" + exe + L"\" x \"" + archivePath + L"\" \"" + destDir + L"\\\"";
+            } else {
+                cmd = L"\"" + exe + L"\" x -ibck \"" + archivePath + L"\" \"" + destDir + L"\\\"";
+            }
+            break;
+
+        case ArchiverApp::AppType::Bandizip:
+            if (isGui) {
+                cmd = L"\"" + exe + L"\" x -target:\"" + destDir + L"\" \"" + archivePath + L"\"";
+            } else {
+                cmd = L"\"" + exe + L"\" x -y -target:\"" + destDir + L"\" \"" + archivePath + L"\"";
+            }
+            break;
+
+        case ArchiverApp::AppType::PeaZip:
+            cmd = L"\"" + exe + L"\" -ext2to \"" + destDir + L"\" \"" + archivePath + L"\"";
+            break;
+
+        case ArchiverApp::AppType::WindowsBuiltIn:
+        default:
+            cmd = L"tar.exe -xf \"" + archivePath + L"\" -C \"" + destDir + L"\"";
+            break;
+    }
+
+    LOG_INFO(L"Executing extraction command (" + app.name + L"): " + cmd);
+
+    std::thread([cmd, isGui, notifyWnd]() {
+        STARTUPINFOW si = { sizeof(si) };
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = isGui ? SW_SHOWNORMAL : SW_HIDE;
+        PROCESS_INFORMATION pi = {0};
+
+        std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+        cmdBuf.push_back(L'\0');
+
+        DWORD creationFlags = isGui ? 0 : CREATE_NO_WINDOW;
+        if (CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, FALSE, creationFlags, NULL, NULL, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            DWORD exitCode = 0;
+            GetExitCodeProcess(pi.hProcess, &exitCode);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            LOG_INFO(L"Extraction finished with exit code: " + std::to_wstring(exitCode));
+        } else {
+            LOG_ERROR(L"Failed to launch archiver process: " + std::to_wstring(GetLastError()));
+        }
+
+        if (notifyWnd) {
+            PostMessageW(notifyWnd, WM_RELOAD_FILES, 0, 0);
+        }
+    }).detach();
+}
+
+/**
+ * @brief Extracts archive to a subfolder named after the archive using the best installed tool.
+ */
+void ExtractArchiveToSubfolder(const std::wstring& archivePath, HWND notifyWnd) {
+    namespace fs = std::filesystem;
+    std::wstring stem;
+    if (!IsArchiveFile(archivePath, &stem)) {
+        stem = fs::path(archivePath).stem().wstring();
+    }
+    std::wstring destDir = (fs::path(g_activeFolder) / stem).wstring();
+
+    std::vector<ArchiverApp> apps = DetectInstalledArchivers();
+    if (!apps.empty()) {
+        ExecuteExtraction(apps[0], archivePath, destDir, false, notifyWnd);
+    }
+}
+
+/**
+ * @brief Extracts archive directly into the current active directory using the best installed tool.
+ */
+void ExtractArchiveHere(const std::wstring& archivePath, HWND notifyWnd) {
+    std::vector<ArchiverApp> apps = DetectInstalledArchivers();
+    if (!apps.empty()) {
+        ExecuteExtraction(apps[0], archivePath, g_activeFolder, false, notifyWnd);
+    }
+}
+
+/**
+ * @brief Extracts archive using a specific installed archiver application with interactive GUI.
+ */
+void ExtractArchiveWithApp(const ArchiverApp& app, const std::wstring& archivePath, const std::wstring& destDir, HWND notifyWnd) {
+    ExecuteExtraction(app, archivePath, destDir, true, notifyWnd);
+}
+
+/**
+ * @brief Displays fallback context menu if Shell COM interface is unavailable.
+ */
+void ShowLegacyContextMenu(const std::vector<std::wstring>& filePaths, POINT pt) {
+    if (filePaths.empty()) return;
+
+    bool isArchive = false;
+    std::wstring archiveStem;
+    if (filePaths.size() == 1) {
+        isArchive = IsArchiveFile(filePaths[0], &archiveStem);
+    }
+
+    std::vector<ArchiverApp> archivers;
+    if (isArchive) {
+        archivers = DetectInstalledArchivers();
+    }
+
+    HMENU hMenu = CreatePopupMenu();
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_OPEN_FILE, L"Open");
+    SetMenuDefaultItem(hMenu, IDM_OPEN_FILE, FALSE);
+
+    const UINT IDM_LEGACY_EXTRACT_TO   = 5001;
+    const UINT IDM_LEGACY_EXTRACT_HERE = 5002;
+    const UINT IDM_LEGACY_WITH_CHOOSE  = 5010;
+    const UINT IDM_LEGACY_WITH_FIRST   = 5020;
+    const UINT IDM_LEGACY_WITH_LAST    = 5050;
+
+    if (isArchive) {
+        InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+        std::wstring extractToStr = L"Extract to \"" + archiveStem + L"\\\"";
+        InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_LEGACY_EXTRACT_TO, extractToStr.c_str());
+        InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_LEGACY_EXTRACT_HERE, L"Extract Here");
+
+        HMENU hExtractWithSub = CreatePopupMenu();
+        for (size_t i = 0; i < archivers.size() && (IDM_LEGACY_WITH_FIRST + i) <= IDM_LEGACY_WITH_LAST; ++i) {
+            InsertMenuW(hExtractWithSub, -1, MF_BYPOSITION | MF_STRING, IDM_LEGACY_WITH_FIRST + static_cast<UINT>(i), archivers[i].name.c_str());
+        }
+        InsertMenuW(hExtractWithSub, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+        InsertMenuW(hExtractWithSub, -1, MF_BYPOSITION | MF_STRING, IDM_LEGACY_WITH_CHOOSE, L"Choose another app...");
+
+        InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_POPUP, reinterpret_cast<UINT_PTR>(hExtractWithSub), L"Extract With");
+    }
+
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_COPY_FILE, L"Copy\tCtrl+C");
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_RENAME_FILE, L"Rename\tF2");
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_DELETE_FILE, L"Delete\tDel");
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_OPEN_FOLDER, L"Open Folder in Explorer");
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_REFRESH, L"Refresh\tF5");
+
+    SetForegroundWindow(g_hWnd);
+    UINT cmd = TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_TOPALIGN | TPM_LEFTALIGN | TPM_RETURNCMD, pt.x, pt.y, 0, g_hWnd, NULL);
+    DestroyMenu(hMenu);
+
+    if (cmd == IDM_LEGACY_EXTRACT_TO && isArchive) {
+        ExtractArchiveToSubfolder(filePaths[0], g_hWnd);
+    } else if (cmd == IDM_LEGACY_EXTRACT_HERE && isArchive) {
+        ExtractArchiveHere(filePaths[0], g_hWnd);
+    } else if (cmd == IDM_LEGACY_WITH_CHOOSE && isArchive) {
+        ShellExecuteW(g_hWnd, L"openas", filePaths[0].c_str(), NULL, NULL, SW_SHOWNORMAL);
+    } else if (cmd >= IDM_LEGACY_WITH_FIRST && cmd <= IDM_LEGACY_WITH_LAST && isArchive) {
+        size_t idx = cmd - IDM_LEGACY_WITH_FIRST;
+        if (idx < archivers.size()) {
+            std::wstring destDir = (std::filesystem::path(g_activeFolder) / archiveStem).wstring();
+            ExtractArchiveWithApp(archivers[idx], filePaths[0], destDir, g_hWnd);
+        }
+    } else if (cmd != 0) {
+        SendMessageW(g_hWnd, WM_COMMAND, MAKEWPARAM(cmd, 0), 0);
+    }
+}
+
+/**
+ * @brief Displays native Windows Shell context menu for selected files/folders.
+ */
+void ShowFileContextMenu(HWND hwnd, const std::vector<std::wstring>& filePaths, POINT pt) {
+    if (filePaths.empty()) return;
+
+    bool isArchive = false;
+    std::wstring archiveStem;
+    if (filePaths.size() == 1) {
+        isArchive = IsArchiveFile(filePaths[0], &archiveStem);
+    }
+
+    std::vector<ArchiverApp> archivers;
+    if (isArchive) {
+        archivers = DetectInstalledArchivers();
+    }
+
+    PIDLIST_ABSOLUTE pidlFolder = nullptr;
+    HRESULT hr = SHParseDisplayName(g_activeFolder.c_str(), nullptr, &pidlFolder, 0, nullptr);
+    if (FAILED(hr) || !pidlFolder) {
+        ShowLegacyContextMenu(filePaths, pt);
+        return;
+    }
+
+    IShellFolder* pDesktop = nullptr;
+    if (FAILED(SHGetDesktopFolder(&pDesktop)) || !pDesktop) {
+        CoTaskMemFree(pidlFolder);
+        ShowLegacyContextMenu(filePaths, pt);
+        return;
+    }
+
+    IShellFolder* pFolder = nullptr;
+    hr = pDesktop->BindToObject(pidlFolder, nullptr, IID_IShellFolder, (void**)&pFolder);
+    pDesktop->Release();
+    if (FAILED(hr) || !pFolder) {
+        CoTaskMemFree(pidlFolder);
+        ShowLegacyContextMenu(filePaths, pt);
+        return;
+    }
+
+    std::vector<LPCITEMIDLIST> childPidls;
+    for (const auto& path : filePaths) {
+        std::filesystem::path p(path);
+        std::wstring fname = p.filename().wstring();
+        PIDLIST_RELATIVE child = nullptr;
+        if (SUCCEEDED(pFolder->ParseDisplayName(hwnd, nullptr, const_cast<LPWSTR>(fname.c_str()), nullptr, &child, nullptr)) && child) {
+            childPidls.push_back(child);
+        }
+    }
+
+    if (childPidls.empty()) {
+        pFolder->Release();
+        CoTaskMemFree(pidlFolder);
+        ShowLegacyContextMenu(filePaths, pt);
+        return;
+    }
+
+    IContextMenu* pContextMenu = nullptr;
+    hr = pFolder->GetUIObjectOf(hwnd, static_cast<UINT>(childPidls.size()), childPidls.data(), IID_IContextMenu, nullptr, (void**)&pContextMenu);
+    if (FAILED(hr) || !pContextMenu) {
+        for (auto* pidl : childPidls) CoTaskMemFree(const_cast<LPITEMIDLIST>(pidl));
+        pFolder->Release();
+        CoTaskMemFree(pidlFolder);
+        ShowLegacyContextMenu(filePaths, pt);
+        return;
+    }
+
+    HMENU hMenu = CreatePopupMenu();
+    const UINT IDM_CUSTOM_EXTRACT_TO   = 1;
+    const UINT IDM_CUSTOM_EXTRACT_HERE = 2;
+    const UINT IDM_EXTRACT_WITH_CHOOSE = 3;
+    const UINT IDM_EXTRACT_WITH_FIRST  = 10;
+    const UINT IDM_EXTRACT_WITH_LAST   = 50;
+    const UINT IDM_SHELL_FIRST         = 100;
+    const UINT IDM_SHELL_LAST          = 0x7FFF;
+
+    if (isArchive) {
+        std::wstring extractToStr = L"Extract to \"" + archiveStem + L"\\\"";
+        InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_CUSTOM_EXTRACT_TO, extractToStr.c_str());
+        InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_CUSTOM_EXTRACT_HERE, L"Extract Here");
+
+        HMENU hExtractWithSub = CreatePopupMenu();
+        for (size_t i = 0; i < archivers.size() && (IDM_EXTRACT_WITH_FIRST + i) <= IDM_EXTRACT_WITH_LAST; ++i) {
+            InsertMenuW(hExtractWithSub, -1, MF_BYPOSITION | MF_STRING, IDM_EXTRACT_WITH_FIRST + static_cast<UINT>(i), archivers[i].name.c_str());
+        }
+        InsertMenuW(hExtractWithSub, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+        InsertMenuW(hExtractWithSub, -1, MF_BYPOSITION | MF_STRING, IDM_EXTRACT_WITH_CHOOSE, L"Choose another app...");
+
+        InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_POPUP, reinterpret_cast<UINT_PTR>(hExtractWithSub), L"Extract With");
+        InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+    }
+
+    pContextMenu->QueryContextMenu(hMenu, GetMenuItemCount(hMenu), IDM_SHELL_FIRST, IDM_SHELL_LAST, CMF_NORMAL | CMF_EXPLORE);
+
+    pContextMenu->QueryInterface(IID_IContextMenu2, (void**)&g_pContextMenu2);
+    pContextMenu->QueryInterface(IID_IContextMenu3, (void**)&g_pContextMenu3);
+
+    SetForegroundWindow(hwnd);
+    UINT cmd = TrackPopupMenu(hMenu, TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, NULL);
+
+    if (g_pContextMenu3) {
+        g_pContextMenu3->Release();
+        g_pContextMenu3 = nullptr;
+    }
+    if (g_pContextMenu2) {
+        g_pContextMenu2->Release();
+        g_pContextMenu2 = nullptr;
+    }
+
+    if (cmd == IDM_CUSTOM_EXTRACT_TO && isArchive) {
+        ExtractArchiveToSubfolder(filePaths[0], hwnd);
+    } else if (cmd == IDM_CUSTOM_EXTRACT_HERE && isArchive) {
+        ExtractArchiveHere(filePaths[0], hwnd);
+    } else if (cmd == IDM_EXTRACT_WITH_CHOOSE && isArchive) {
+        ShellExecuteW(hwnd, L"openas", filePaths[0].c_str(), NULL, NULL, SW_SHOWNORMAL);
+    } else if (cmd >= IDM_EXTRACT_WITH_FIRST && cmd <= IDM_EXTRACT_WITH_LAST && isArchive) {
+        size_t idx = cmd - IDM_EXTRACT_WITH_FIRST;
+        if (idx < archivers.size()) {
+            std::wstring destDir = (std::filesystem::path(g_activeFolder) / archiveStem).wstring();
+            ExtractArchiveWithApp(archivers[idx], filePaths[0], destDir, hwnd);
+        }
+    } else if (cmd >= IDM_SHELL_FIRST && cmd <= IDM_SHELL_LAST) {
+        CMINVOKECOMMANDINFOEX cmi = {0};
+        cmi.cbSize = sizeof(cmi);
+        cmi.fMask = CMIC_MASK_UNICODE;
+        cmi.hwnd = hwnd;
+        cmi.lpVerb = (LPCSTR)MAKEINTRESOURCEA(cmd - IDM_SHELL_FIRST);
+        cmi.lpVerbW = (LPCWSTR)MAKEINTRESOURCEW(cmd - IDM_SHELL_FIRST);
+        cmi.nShow = SW_SHOWNORMAL;
+        pContextMenu->InvokeCommand(reinterpret_cast<LPCMINVOKECOMMANDINFO>(&cmi));
+
+        PostMessageW(hwnd, WM_RELOAD_FILES, 0, 0);
+    }
+
+    DestroyMenu(hMenu);
+    pContextMenu->Release();
+    for (auto* pidl : childPidls) CoTaskMemFree(const_cast<LPITEMIDLIST>(pidl));
+    pFolder->Release();
+    CoTaskMemFree(pidlFolder);
+}
+
+/**
+ * @brief Displays background context menu for empty space in the active folder.
+ */
+void ShowBackgroundContextMenu(HWND hwnd, POINT pt) {
+    HMENU hMenu = CreatePopupMenu();
+
+    HMENU hViewSub = CreatePopupMenu();
+    InsertMenuW(hViewSub, 0, MF_BYPOSITION | MF_STRING | (g_viewMode == ViewMode::Small ? MF_CHECKED : 0), IDM_VIEW_SMALL, L"Small (List)");
+    InsertMenuW(hViewSub, 1, MF_BYPOSITION | MF_STRING | (g_viewMode == ViewMode::Medium ? MF_CHECKED : 0), IDM_VIEW_MEDIUM, L"Medium (2-Column Grid)");
+    InsertMenuW(hViewSub, 2, MF_BYPOSITION | MF_STRING | (g_viewMode == ViewMode::Big ? MF_CHECKED : 0), IDM_VIEW_BIG, L"Big (Large Thumbnails)");
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_POPUP, (UINT_PTR)hViewSub, L"View");
+
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_REFRESH, L"Refresh\tF5");
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+
+    bool canPaste = CanPasteFromClipboard();
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING | (canPaste ? 0 : MF_GRAYED), IDM_PASTE_FILE, L"Paste\tCtrl+V");
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+
+    HMENU hNewSub = CreatePopupMenu();
+    InsertMenuW(hNewSub, -1, MF_BYPOSITION | MF_STRING, IDM_NEW_FOLDER, L"Folder\tCtrl+Shift+N");
+    InsertMenuW(hNewSub, -1, MF_BYPOSITION | MF_STRING, IDM_NEW_FILE, L"Text Document");
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_POPUP, (UINT_PTR)hNewSub, L"New");
+
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_TOGGLE_TREE, g_showFolderTree ? L"Hide Folder Tree" : L"Show Folder Tree");
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_OPEN_FOLDER, L"Open Folder in Explorer");
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_EXIT, L"Exit Quicky");
+
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_TOPALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(hMenu);
+}
+
+/**
+ * @brief Displays context menu for ListView control, choosing item or background menu.
  */
 void ShowListViewContextMenu(POINT pt) {
     LVHITTESTINFO hti = {0};
@@ -1420,39 +2149,23 @@ void ShowListViewContextMenu(POINT pt) {
             ListView_SetItemState(g_hListView, -1, 0, LVIS_SELECTED);
             ListView_SetItemState(g_hListView, hitItem, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
         }
+
+        std::vector<int> selected = GetSelectedListViewIndices();
+        std::vector<std::wstring> paths;
+        for (int idx : selected) {
+            if (idx >= 0 && idx < static_cast<int>(g_displayedFiles.size())) {
+                paths.push_back(g_displayedFiles[idx].fullPath);
+            }
+        }
+
+        if (!paths.empty()) {
+            ShowFileContextMenu(g_hWnd, paths, pt);
+            return;
+        }
     }
 
-    std::vector<int> selected = GetSelectedListViewIndices();
-    bool hasSelection = !selected.empty();
-
-    HMENU hMenu = CreatePopupMenu();
-    if (hasSelection) {
-        InsertMenuW(hMenu, 0, MF_BYPOSITION | MF_STRING, IDM_OPEN_FILE, L"Open / View");
-        SetMenuDefaultItem(hMenu, IDM_OPEN_FILE, FALSE);
-        InsertMenuW(hMenu, 1, MF_BYPOSITION | MF_STRING, IDM_COPY_FILE, L"Copy\tCtrl+C");
-        InsertMenuW(hMenu, 2, MF_BYPOSITION | MF_STRING, IDM_RENAME_FILE, L"Rename\tF2");
-        InsertMenuW(hMenu, 3, MF_BYPOSITION | MF_STRING, IDM_DELETE_FILE, L"Delete\tDel");
-        InsertMenuW(hMenu, 4, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
-    }
-
-    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_PASTE_FILE, L"Paste\tCtrl+V");
-
-    // Submenu for 3 view modes
-    HMENU hViewSub = CreatePopupMenu();
-    InsertMenuW(hViewSub, 0, MF_BYPOSITION | MF_STRING | (g_viewMode == ViewMode::Small ? MF_CHECKED : 0), IDM_VIEW_SMALL, L"Small (List)");
-    InsertMenuW(hViewSub, 1, MF_BYPOSITION | MF_STRING | (g_viewMode == ViewMode::Medium ? MF_CHECKED : 0), IDM_VIEW_MEDIUM, L"Medium (2-Column Grid)");
-    InsertMenuW(hViewSub, 2, MF_BYPOSITION | MF_STRING | (g_viewMode == ViewMode::Big ? MF_CHECKED : 0), IDM_VIEW_BIG, L"Big (Large Thumbnails)");
-    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_POPUP, (UINT_PTR)hViewSub, L"View Mode");
-
-    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_TOGGLE_TREE, g_showFolderTree ? L"Hide Folder Tree" : L"Show Folder Tree");
-    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_OPEN_FOLDER, L"Open Folder in Explorer");
-    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_REFRESH, L"Refresh\tF5");
-    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
-    InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, IDM_EXIT, L"Exit Quicky");
-
-    SetForegroundWindow(g_hWnd);
-    TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_TOPALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, g_hWnd, NULL);
-    DestroyMenu(hMenu);
+    ListView_SetItemState(g_hListView, -1, 0, LVIS_SELECTED);
+    ShowBackgroundContextMenu(g_hWnd, pt);
 }
 
 /**

@@ -21,6 +21,7 @@ target_link_libraries(Quicky PRIVATE
     oleaut32
     dwmapi
     shlwapi
+    gdiplus
 )
 
 # Enable modern common controls and Unicode

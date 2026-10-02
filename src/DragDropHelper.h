@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <filesystem>
+#include <gdiplus.h>
 #include "Logger.h"
 
 /**
@@ -466,48 +467,187 @@ inline bool CopyFilesToClipboard(const std::vector<std::wstring>& paths) {
 }
 
 /**
- * @brief Pastes any CF_HDROP files from the Windows clipboard into the target folder.
+ * @brief Retrieves the encoder CLSID for a specified MIME type (e.g. L"image/png").
  */
-inline bool PasteFilesFromClipboard(const std::wstring& destFolder, HWND notifyWnd) {
-    IDataObject* pDataObject = nullptr;
-    HRESULT hr = OleGetClipboard(&pDataObject);
-    if (FAILED(hr) || !pDataObject) {
-        LOG_WARN(L"Clipboard does not contain accessible IDataObject");
+inline int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
+    UINT num = 0;
+    UINT size = 0;
+    Gdiplus::GetImageEncodersSize(&num, &size);
+    if (size == 0) return -1;
+
+    std::vector<BYTE> memory(size);
+    Gdiplus::ImageCodecInfo* pImageCodecInfo = reinterpret_cast<Gdiplus::ImageCodecInfo*>(memory.data());
+    Gdiplus::GetImageEncoders(num, size, pImageCodecInfo);
+
+    for (UINT j = 0; j < num; ++j) {
+        if (wcscmp(pImageCodecInfo[j].MimeType, format) == 0) {
+            *pClsid = pImageCodecInfo[j].Clsid;
+            return static_cast<int>(j);
+        }
+    }
+    return -1;
+}
+
+/**
+ * @brief Generates a collision-safe timestamped filename for pasted images.
+ */
+inline std::wstring GenerateImageFilename(const std::wstring& targetDir) {
+    namespace fs = std::filesystem;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t baseName[64];
+    swprintf_s(baseName, L"Image_%04d-%02d-%02d_%02d%02d%02d",
+              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    std::wstring candidate = (fs::path(targetDir) / (std::wstring(baseName) + L".png")).wstring();
+    int counter = 1;
+    while (fs::exists(candidate)) {
+        wchar_t suffix[32];
+        swprintf_s(suffix, L" (%d).png", counter++);
+        candidate = (fs::path(targetDir) / (std::wstring(baseName) + suffix)).wstring();
+    }
+    return candidate;
+}
+
+/**
+ * @brief Checks if clipboard contains pasteable files or image data.
+ */
+inline bool CanPasteFromClipboard() {
+    if (IsClipboardFormatAvailable(CF_HDROP)) return true;
+    UINT cfPng = RegisterClipboardFormatW(L"PNG");
+    if (cfPng != 0 && IsClipboardFormatAvailable(cfPng)) return true;
+    if (IsClipboardFormatAvailable(CF_DIB)) return true;
+    if (IsClipboardFormatAvailable(CF_DIBV5)) return true;
+    if (IsClipboardFormatAvailable(CF_BITMAP)) return true;
+    return false;
+}
+
+/**
+ * @brief Pastes bitmap or PNG data from clipboard directly into target folder.
+ */
+inline bool PasteImageFromClipboard(const std::wstring& destFolder) {
+    UINT cfPng = RegisterClipboardFormatW(L"PNG");
+    bool hasPng = (cfPng != 0 && IsClipboardFormatAvailable(cfPng));
+    bool hasDib = IsClipboardFormatAvailable(CF_DIB) || IsClipboardFormatAvailable(CF_DIBV5);
+    bool hasBmp = IsClipboardFormatAvailable(CF_BITMAP);
+
+    if (!hasPng && !hasDib && !hasBmp) {
         return false;
     }
 
-    FORMATETC fmt = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
-    STGMEDIUM stg = {0};
-    bool success = false;
+    if (!OpenClipboard(NULL)) {
+        LOG_ERROR(L"OpenClipboard failed in PasteImageFromClipboard");
+        return false;
+    }
 
-    if (SUCCEEDED(pDataObject->GetData(&fmt, &stg))) {
-        HDROP hDrop = static_cast<HDROP>(stg.hGlobal);
-        UINT fileCount = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
-        LOG_INFO(L"Pasting " + std::to_wstring(fileCount) + L" file(s) from clipboard");
+    bool saved = false;
+    std::wstring filePath = GenerateImageFilename(destFolder);
 
-        for (UINT i = 0; i < fileCount; i++) {
-            wchar_t filePath[MAX_PATH];
-            if (DragQueryFileW(hDrop, i, filePath, MAX_PATH)) {
-                std::filesystem::path src(filePath);
-                std::filesystem::path dest = std::filesystem::path(destFolder) / src.filename();
-                try {
-                    std::filesystem::copy(src, dest, std::filesystem::copy_options::overwrite_existing);
-                    LOG_INFO(L"Pasted file: " + src.wstring());
-                    success = true;
-                } catch (...) {
-                    LOG_ERROR(L"Error pasting file: " + src.wstring());
+    // 1. Try raw PNG clipboard data first (browsers provide pristine PNG bytes)
+    if (hasPng) {
+        HANDLE hData = GetClipboardData(cfPng);
+        if (hData) {
+            void* pData = GlobalLock(hData);
+            size_t size = GlobalSize(hData);
+            if (pData && size > 0) {
+                FILE* fp = nullptr;
+                if (_wfopen_s(&fp, filePath.c_str(), L"wb") == 0 && fp) {
+                    fwrite(pData, 1, size, fp);
+                    fclose(fp);
+                    LOG_INFO(L"Pasted PNG from clipboard to: " + filePath);
+                    saved = true;
+                }
+            }
+            GlobalUnlock(hData);
+        }
+    }
+
+    // 2. If not raw PNG, convert CF_BITMAP / CF_DIB via GDI+
+    if (!saved && (hasBmp || hasDib)) {
+        CLSID pngClsid;
+        if (GetEncoderClsid(L"image/png", &pngClsid) >= 0) {
+            HBITMAP hBmp = static_cast<HBITMAP>(GetClipboardData(CF_BITMAP));
+            if (hBmp) {
+                Gdiplus::Bitmap bmp(hBmp, NULL);
+                if (bmp.Save(filePath.c_str(), &pngClsid, NULL) == Gdiplus::Ok) {
+                    LOG_INFO(L"Pasted bitmap from clipboard as PNG to: " + filePath);
+                    saved = true;
+                }
+            } else if (hasDib) {
+                HANDLE hDib = GetClipboardData(CF_DIB);
+                if (hDib) {
+                    BITMAPINFO* pbi = static_cast<BITMAPINFO*>(GlobalLock(hDib));
+                    if (pbi) {
+                        int colors = pbi->bmiHeader.biClrUsed;
+                        if (colors == 0 && pbi->bmiHeader.biBitCount <= 8) {
+                            colors = 1 << pbi->bmiHeader.biBitCount;
+                        }
+                        BYTE* pPixels = reinterpret_cast<BYTE*>(pbi) + pbi->bmiHeader.biSize + (colors * sizeof(RGBQUAD));
+                        if (pbi->bmiHeader.biCompression == BI_BITFIELDS) {
+                            pPixels += 12;
+                        }
+                        Gdiplus::Bitmap bmp(pbi, pPixels);
+                        if (bmp.Save(filePath.c_str(), &pngClsid, NULL) == Gdiplus::Ok) {
+                            LOG_INFO(L"Pasted DIB from clipboard as PNG to: " + filePath);
+                            saved = true;
+                        }
+                        GlobalUnlock(hDib);
+                    }
                 }
             }
         }
-        ReleaseStgMedium(&stg);
-
-        if (success && notifyWnd) {
-            PostMessageW(notifyWnd, WM_USER + 100, 0, 0);
-        }
-    } else {
-        LOG_INFO(L"Clipboard does not contain file drop data (CF_HDROP)");
     }
 
-    pDataObject->Release();
+    CloseClipboard();
+    return saved;
+}
+
+/**
+ * @brief Pastes any CF_HDROP files or clipboard images into the target folder.
+ */
+inline bool PasteFilesFromClipboard(const std::wstring& destFolder, HWND notifyWnd) {
+    bool success = false;
+
+    // 1. Try pasting files (CF_HDROP)
+    if (IsClipboardFormatAvailable(CF_HDROP)) {
+        IDataObject* pDataObject = nullptr;
+        HRESULT hr = OleGetClipboard(&pDataObject);
+        if (SUCCEEDED(hr) && pDataObject) {
+            FORMATETC fmt = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+            STGMEDIUM stg = {0};
+            if (SUCCEEDED(pDataObject->GetData(&fmt, &stg))) {
+                HDROP hDrop = static_cast<HDROP>(stg.hGlobal);
+                UINT fileCount = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
+                LOG_INFO(L"Pasting " + std::to_wstring(fileCount) + L" file(s) from clipboard");
+
+                for (UINT i = 0; i < fileCount; i++) {
+                    wchar_t filePath[MAX_PATH];
+                    if (DragQueryFileW(hDrop, i, filePath, MAX_PATH)) {
+                        std::filesystem::path src(filePath);
+                        std::filesystem::path dest = std::filesystem::path(destFolder) / src.filename();
+                        try {
+                            std::filesystem::copy(src, dest, std::filesystem::copy_options::overwrite_existing | std::filesystem::copy_options::recursive);
+                            LOG_INFO(L"Pasted file: " + src.wstring());
+                            success = true;
+                        } catch (...) {
+                            LOG_ERROR(L"Error pasting file: " + src.wstring());
+                        }
+                    }
+                }
+                ReleaseStgMedium(&stg);
+            }
+            pDataObject->Release();
+        }
+    }
+
+    // 2. If no files were pasted, check for clipboard image
+    if (!success) {
+        success = PasteImageFromClipboard(destFolder);
+    }
+
+    if (success && notifyWnd) {
+        PostMessageW(notifyWnd, WM_USER + 100, 0, 0);
+    }
+
     return success;
 }
