@@ -1,0 +1,33 @@
+# Build and compiler output
+build/
+bin/
+obj/
+*.log
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.suo
+*.user
+
+# IDE and Editor configurations
+.vs/
+.vscode/
+*.sln.docstates
+
+# Temporary files
+*.tmp
+*~
+
+# Python scripts & virtual environments
+*.py
+*.pyc
+__pycache__/
+venv/
+.venv/
+
+# AI Agent configuration
+.agents/
+
+# Implementation plans & scratch notes
+*Implementation_Plan*.md
